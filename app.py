@@ -1,9 +1,10 @@
 import streamlit as st
 import base64
 from openai import OpenAI
+import time
+import logging
+import json
 
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -15,12 +16,40 @@ from PIL import Image
 import io
 
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+def log_step(name, start, end, status="SUCCESS", error=None):
+    log_data = {
+        "step": name,
+        "status": status,
+        "start_time": round(start, 4),
+        "end_time": round(end, 4),
+        "duration_ms": round((end - start) * 1000, 2)
+    }
+    if error:
+        log_data["error"] = str(error)
+
+    logging.info(json.dumps(log_data))
+
+
+def rerank_documents(query, docs):
+    scored_docs = []
+
+    for d in docs:
+        score = d.page_content.lower().count(query.lower())
+        scored_docs.append((score, d))
+
+    scored_docs.sort(reverse=True, key=lambda x: x[0])
+
+    return [d for _, d in scored_docs[:2]]
+
+
 client = OpenAI(
     base_url="https://router.huggingface.co/v1",
-    api_key="MY_TOKEN"
+    api_key="my_token"
 )
 
-MODEL = "Qwen/Qwen2.5-VL-7B-Instruct:hyperbolic"
+MODEL = "Qwen/Qwen3-VL-8B-Instruct:novita"
 FALLBACK = "meta-llama/Llama-3.1-8B-Instruct"
 
 create_tables()
@@ -28,9 +57,6 @@ create_tables()
 
 if "chat" not in st.session_state:
     st.session_state.chat = []
-
-if "memory" not in st.session_state:
-    st.session_state.memory = ChatMessageHistory()
 
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
@@ -57,6 +83,7 @@ embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
+
 def process_document(file):
     file_bytes = file.read()
     file_name = file.name
@@ -81,7 +108,16 @@ def process_document(file):
             from langchain_community.document_loaders import TextLoader
             loader = TextLoader(temp_path, encoding="utf-8")
 
-        docs = loader.load()
+        start = time.time()
+        try:
+            docs = loader.load()
+            end = time.time()
+            log_step("DOC_LOADING", start, end, "SUCCESS")
+        except Exception as e:
+            end = time.time()
+            log_step("DOC_LOADING", start, end, "FAILED", e)
+            st.error(f"Doc error: {str(e)}")
+            return
 
     except Exception as e:
         st.error(f"Doc error: {str(e)}")
@@ -102,136 +138,78 @@ def chat_llm(prompt):
         res = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt[:4000]}],
-            max_tokens=500
+            
         )
         return res.choices[0].message.content
     except:
         res = client.chat.completions.create(
             model=FALLBACK,
             messages=[{"role": "user", "content": prompt[:3000]}],
-            max_tokens=500
         )
         return res.choices[0].message.content
 
 
-def generate_full_summary():
+def generate_summary():
+    text = ""
+    for m in st.session_state.chat:
+        text += f"{m['role']}: {m['content']}\n"
 
-    if not st.session_state.chat:
-        return "No conversation found."
+    return chat_llm(f"Summarize:\n{text}")
 
-    ordered_points = []
-
-    for i, m in enumerate(st.session_state.chat, 1):
-        role = m["role"]
-        content = m["content"]
-
-
-        point = f"Step {i}: {role} discussed - {content[:80]}"
-        ordered_points.append(point)
-
-        if m.get("image"):
-            ordered_points.append(f"Step {i}: Image was analyzed")
-
-    steps_text = "\n".join(ordered_points)
-
-    summary = chat_llm(f"""
-You are given a conversation in STRICT ORDER.
-
-These are the steps (DO NOT SKIP ANY):
-{steps_text}
-
-YOUR TASK:
-Write ONE paragraph summary that follows EXACT SAME ORDER.
-
-STRICT RULES:
-- Follow Step 1 → Step N in order
-- EVERY step MUST appear in summary
-- DO NOT skip final steps (IMPORTANT)
-- DO NOT prioritize topics
-- DO NOT merge unrelated steps
-- Include ALL topics (including Angular at end)
-- Include image analysis
-- Keep natural paragraph flow
-
-If ANY step is missing → answer is WRONG.
-
-Final Paragraph Summary:
-""")
-
-    return summary
-
-st.title("Multimodal RAG Chatbot")
 
 if "user_id" not in st.session_state:
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
 
-    if st.button("Register"):
-        if register(u, p):
-            st.success("Registered")
+    col1, col2, col3 = st.columns([1, 2, 1])
 
-    if st.button("Login"):
-        user = login(u, p)
-        if user:
-            st.session_state.user_id = user.id
-            st.rerun()
+    with col2:
+        st.title("Multimodal RAG Chatbot")
+
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+
+        if st.button("Login"):
+            user = login(u, p)
+            if user:
+                st.session_state.user_id = user.id
+                st.rerun()
 
 else:
+
     st.sidebar.title("Chats")
 
-    # RESET CHAT
     if st.sidebar.button("New Chat"):
         st.session_state.chat = []
-        st.session_state.memory = ChatMessageHistory()
         st.session_state.conversation_id = None
         st.session_state.vectorstore = None
-        st.session_state.uploaded_image = None
-        st.session_state.use_image_next = False
         st.rerun()
 
-    # SUMMARY BUTTON
-    if st.sidebar.button("Full Session Summary"):
-        summary = generate_full_summary()
-
-        st.session_state.chat.append({
-            "role": "assistant",
-            "content": f" Summary:\n\n{summary}",
-            "image": None
-        })
-
-        if st.session_state.conversation_id:
-            save_summary(st.session_state.conversation_id, summary)
-
-        st.rerun()
-
-    # LOAD HISTORY
     for cid, title in get_conversations(st.session_state.user_id):
         if st.sidebar.button(title, key=f"chat_{cid}"):
 
             st.session_state.conversation_id = cid
-            msgs = get_messages(cid)
-
-            st.session_state.chat = msgs
+            st.session_state.chat = get_messages(cid)
             st.rerun()
 
-    # IMAGE
     img = st.file_uploader("Upload Image", type=["png","jpg","jpeg"])
 
     if img:
-        try:
-            st.session_state.uploaded_image = optimize_image(img.read())
-            st.session_state.use_image_next = True
-            st.success("Image ready")
-        except:
-            st.error("Invalid image")
+        st.session_state.uploaded_image = optimize_image(img.read())
+        st.session_state.use_image_next = True
+        st.success("Image ready")
 
-    # DOC
     doc = st.file_uploader("Upload Doc", type=["pdf","txt"])
 
     if doc:
         process_document(doc)
-    else:
-        st.session_state.vectorstore = None
+
+    col1, col2 = st.columns([6,1])
+    with col1:
+        st.markdown("### 💬 Chat")
+    with col2:
+        if st.button("📝"):
+            summary = generate_summary()
+            save_summary(st.session_state.conversation_id, summary)
+            st.session_state.chat.append({"role":"assistant","content":summary})
 
     prompt = st.chat_input("Ask...")
 
@@ -240,57 +218,67 @@ else:
         if st.session_state.conversation_id is None:
             st.session_state.conversation_id = create_conversation(
                 st.session_state.user_id,
-                prompt[:30]
+                prompt[:50]
             )
 
-        img_data = None
-        if st.session_state.use_image_next and st.session_state.uploaded_image:
-            img_data = base64.b64encode(st.session_state.uploaded_image).decode()
-
-
         rag_context = ""
-        use_doc = False
 
-        if st.session_state.vectorstore is not None:
+        if st.session_state.vectorstore:
 
-            if "analyze" in prompt.lower() or "analyse" in prompt.lower():
-                docs = st.session_state.vectorstore.similarity_search(
-                    "summary of document", k=3
-                )
-                use_doc = True
-            else:
+            start = time.time()
+            try:
                 docs = st.session_state.vectorstore.similarity_search(prompt, k=2)
+                end = time.time()
+                log_step("RETRIEVAL", start, end, "SUCCESS")
+            except Exception as e:
+                end = time.time()
+                log_step("RETRIEVAL", start, end, "FAILED", e)
+                docs = []
 
-                if docs:
-                    use_doc = True
+            start = time.time()
+            try:
+                docs = rerank_documents(prompt, docs)
+                end = time.time()
+                log_step("RERANK", start, end, "SUCCESS")
+            except Exception as e:
+                end = time.time()
+                log_step("RERANK", start, end, "FAILED", e)
 
             rag_context = "\n".join([d.page_content for d in docs])
 
- 
-        if use_doc and rag_context.strip():
-            final_prompt = f"""
-Use ONLY this document context:
+        else:
+            print("[RETRIEVAL] skipped (no docs)")
+
+    
+        start = time.time()
+        try:
+            if st.session_state.vectorstore:
+                final_prompt = f"""
+Use the context to answer accurately.
 
 {rag_context}
 
-Question:
-{prompt}
-
-Answer clearly:
+Question: {prompt}
 """
-        else:
-            final_prompt = f"""
-Answer normally:
+            else:
+                final_prompt = f"""
+Answer clearly and accurately.
 
-Question:
-{prompt}
+Question: {prompt}
 """
 
+            end = time.time()
+            log_step("PROMPT_CREATION", start, end, "SUCCESS")
+
+        except Exception as e:
+            end = time.time()
+            log_step("PROMPT_CREATION", start, end, "FAILED", e)
 
         if st.session_state.use_image_next and st.session_state.uploaded_image:
 
             img_base64 = base64.b64encode(st.session_state.uploaded_image).decode()
 
+            start = time.time()
             try:
                 response = client.chat.completions.create(
                     model=MODEL,
@@ -298,35 +286,57 @@ Question:
                         "role": "user",
                         "content": [
                             {"type": "text", "text": final_prompt[:3000]},
-                            {"type": "image_url",
-                             "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{img_base64}"
+                                }
+                            }
                         ]
                     }],
-                    max_tokens=500
+                    
                 )
-
                 res = response.choices[0].message.content
+                end = time.time()
+                log_step("LLM_GENERATION", start, end, "SUCCESS")
+            except Exception as e:
+                end = time.time()
+                log_step("LLM_GENERATION", start, end, "FAILED", e)
+                res = "Error generating response"
 
-            except:
-                res = chat_llm(final_prompt)
-
-
+            img_data = img_base64
             st.session_state.use_image_next = False
             st.session_state.uploaded_image = None
 
         else:
-            res = chat_llm(final_prompt)
 
+            start = time.time()
+            try:
+                res = chat_llm(final_prompt)
+                end = time.time()
+                log_step("LLM_GENERATION", start, end, "SUCCESS")
+            except Exception as e:
+                end = time.time()
+                log_step("LLM_GENERATION", start, end, "FAILED", e)
+                res = "Error generating response"
 
-        save_message(st.session_state.conversation_id, "user", prompt, img_data)
-        save_message(st.session_state.conversation_id, "assistant", res)
+            img_data = None
+
+        start = time.time()
+        try:
+            save_message(st.session_state.conversation_id, "user", prompt, img_data)
+            save_message(st.session_state.conversation_id, "assistant", res)
+            end = time.time()
+            log_step("POST_PROCESSING", start, end, "SUCCESS")
+        except Exception as e:
+            end = time.time()
+            log_step("POST_PROCESSING", start, end, "FAILED", e)
 
         st.session_state.chat.append({"role":"user","content":prompt,"image":img_data})
         st.session_state.chat.append({"role":"assistant","content":res,"image":None})
 
-
     for m in st.session_state.chat:
         with st.chat_message(m["role"]):
-            st.write(m["content"])
+            st.markdown(m["content"])
             if m.get("image"):
-                st.image(base64.b64decode(m["image"]))
+                st.image(base64.b64decode(m["image"]), width="stretch")
