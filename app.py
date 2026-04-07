@@ -6,15 +6,12 @@ import logging
 import json
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from auth import login, register
 from chat_db import *
 
 from PIL import Image
 import io
-
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -32,16 +29,83 @@ def log_step(name, start, end, status="SUCCESS", error=None):
     logging.info(json.dumps(log_data))
 
 
-def rerank_documents(query, docs):
-    scored_docs = []
 
-    for d in docs:
-        score = d.page_content.lower().count(query.lower())
-        scored_docs.append((score, d))
+def retrieve_relevant_chunks(query, documents, top_k=10):
+    query_words = set(query.lower().split())
 
-    scored_docs.sort(reverse=True, key=lambda x: x[0])
+    scored = []
+    for doc in documents:
+        text = doc.page_content.lower()
 
-    return [d for _, d in scored_docs[:2]]
+        score = 0
+
+   
+        for word in query_words:
+            if word in text:
+                score += 2
+
+      
+        for word in query_words:
+            for token in text.split():
+                if word in token or token in word:
+                    score += 1
+
+        
+        if any(char.isdigit() for char in text):
+            score += 2
+
+       
+        if any(k in text for k in ["reward", "score", "goal", "pass", "interception"]):
+            score += 2
+
+       
+        scored.append((score, doc))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+
+    return [doc for score, doc in scored][:top_k]
+
+
+
+def expand_query(prompt):
+    base_query = prompt
+
+    base_query += " reward design scoring goal pass interception losing possession opponent scoring values table points numbers"
+
+    return base_query
+
+
+
+def smart_rag_response(prompt, rag_context):
+
+  
+    if rag_context and len(rag_context.strip()) > 50:
+
+        rag_prompt = f"""
+You are an intelligent assistant.
+
+IMPORTANT RULES:
+- Use the provided context FIRST
+- If numerical values or points are present → use them EXACTLY
+- DO NOT assume or create new values
+- Only use general knowledge if context is missing information
+
+Context:
+{rag_context}
+
+Question:
+{prompt}
+"""
+        return chat_llm(rag_prompt)
+
+
+    else:
+        fallback_prompt = f"""
+Answer the following question using your general knowledge:
+
+{prompt}
+"""
+        return chat_llm(fallback_prompt)
 
 
 client = OpenAI(
@@ -61,11 +125,8 @@ if "chat" not in st.session_state:
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
 
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-if "use_image_next" not in st.session_state:
-    st.session_state.use_image_next = False
+if "documents" not in st.session_state:
+    st.session_state.documents = None
 
 if "uploaded_image" not in st.session_state:
     st.session_state.uploaded_image = None
@@ -79,14 +140,9 @@ def optimize_image(img_bytes):
     return buffer.getvalue()
 
 
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-
 def process_document(file):
     file_bytes = file.read()
-    file_name = file.name
+    file_name = file.name.lower()
 
     if st.session_state.conversation_id is None:
         st.session_state.conversation_id = create_conversation(
@@ -96,7 +152,7 @@ def process_document(file):
 
     save_document(st.session_state.conversation_id, file_bytes)
 
-    temp_path = f"temp_{file_name}"
+    temp_path = f"temp_{file.name}"
     with open(temp_path, "wb") as f:
         f.write(file_bytes)
 
@@ -104,31 +160,29 @@ def process_document(file):
         if file_name.endswith(".pdf"):
             from langchain_community.document_loaders import PyPDFLoader
             loader = PyPDFLoader(temp_path)
+
+        elif file_name.endswith(".ppt") or file_name.endswith(".pptx"):
+            from langchain_community.document_loaders import UnstructuredPowerPointLoader
+            loader = UnstructuredPowerPointLoader(temp_path, strategy="fast")
+
         else:
             from langchain_community.document_loaders import TextLoader
             loader = TextLoader(temp_path, encoding="utf-8")
 
         start = time.time()
-        try:
-            docs = loader.load()
-            end = time.time()
-            log_step("DOC_LOADING", start, end, "SUCCESS")
-        except Exception as e:
-            end = time.time()
-            log_step("DOC_LOADING", start, end, "FAILED", e)
-            st.error(f"Doc error: {str(e)}")
-            return
+        docs = loader.load()
+        end = time.time()
+        log_step("DOC_LOADING", start, end, "SUCCESS")
 
     except Exception as e:
+        log_step("DOC_LOADING", start, time.time(), "FAILED", e)
         st.error(f"Doc error: {str(e)}")
         return
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
 
-    st.session_state.vectorstore = FAISS.from_documents(
-        splitter.split_documents(docs),
-        embedding_model
-    )
+    st.session_state.documents = chunks
 
     st.success("Document ready!")
 
@@ -138,7 +192,6 @@ def chat_llm(prompt):
         res = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt[:4000]}],
-            
         )
         return res.choices[0].message.content
     except:
@@ -155,6 +208,7 @@ def generate_summary():
         text += f"{m['role']}: {m['content']}\n"
 
     return chat_llm(f"Summarize:\n{text}")
+
 
 
 if "user_id" not in st.session_state:
@@ -180,12 +234,12 @@ else:
     if st.sidebar.button("New Chat"):
         st.session_state.chat = []
         st.session_state.conversation_id = None
-        st.session_state.vectorstore = None
+        st.session_state.documents = None
+        st.session_state.uploaded_image = None
         st.rerun()
 
     for cid, title in get_conversations(st.session_state.user_id):
         if st.sidebar.button(title, key=f"chat_{cid}"):
-
             st.session_state.conversation_id = cid
             st.session_state.chat = get_messages(cid)
             st.rerun()
@@ -194,12 +248,13 @@ else:
 
     if img:
         st.session_state.uploaded_image = optimize_image(img.read())
-        st.session_state.use_image_next = True
+        st.session_state.documents = None
         st.success("Image ready")
 
-    doc = st.file_uploader("Upload Doc", type=["pdf","txt"])
+    doc = st.file_uploader("Upload Doc", type=["pdf","txt","ppt","pptx"])
 
     if doc:
+        st.session_state.uploaded_image = None
         process_document(doc)
 
     col1, col2 = st.columns([6,1])
@@ -223,120 +278,64 @@ else:
 
         rag_context = ""
 
-        if st.session_state.vectorstore:
+        if st.session_state.documents:
 
-            start = time.time()
-            try:
-                docs = st.session_state.vectorstore.similarity_search(prompt, k=2)
-                end = time.time()
-                log_step("RETRIEVAL", start, end, "SUCCESS")
-            except Exception as e:
-                end = time.time()
-                log_step("RETRIEVAL", start, end, "FAILED", e)
-                docs = []
+            better_query = expand_query(prompt)
 
-            start = time.time()
-            try:
-                docs = rerank_documents(prompt, docs)
-                end = time.time()
-                log_step("RERANK", start, end, "SUCCESS")
-            except Exception as e:
-                end = time.time()
-                log_step("RERANK", start, end, "FAILED", e)
+            docs = retrieve_relevant_chunks(
+                better_query,
+                st.session_state.documents,
+                top_k=10
+            )
 
-            rag_context = "\n".join([d.page_content for d in docs])
-
-        else:
-            print("[RETRIEVAL] skipped (no docs)")
-
-    
-        start = time.time()
-        try:
-            if st.session_state.vectorstore:
-                final_prompt = f"""
-Use the context to answer accurately.
-
-{rag_context}
-
-Question: {prompt}
-"""
+            if docs:
+                rag_context = "\n".join([d.page_content for d in docs])
             else:
-                final_prompt = f"""
-Answer clearly and accurately.
+                rag_context = ""
 
-Question: {prompt}
-"""
+            print("\n===== RETRIEVED CONTEXT =====\n")
+            print(rag_context)
+            print("\n=============================\n")
 
-            end = time.time()
-            log_step("PROMPT_CREATION", start, end, "SUCCESS")
+        start = time.time()
 
-        except Exception as e:
-            end = time.time()
-            log_step("PROMPT_CREATION", start, end, "FAILED", e)
 
-        if st.session_state.use_image_next and st.session_state.uploaded_image:
+        if st.session_state.uploaded_image:
 
             img_base64 = base64.b64encode(st.session_state.uploaded_image).decode()
 
-            start = time.time()
-            try:
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": final_prompt[:3000]},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{img_base64}"
-                                }
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt[:3000]},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_base64}"
                             }
-                        ]
-                    }],
-                    
-                )
-                res = response.choices[0].message.content
-                end = time.time()
-                log_step("LLM_GENERATION", start, end, "SUCCESS")
-            except Exception as e:
-                end = time.time()
-                log_step("LLM_GENERATION", start, end, "FAILED", e)
-                res = "Error generating response"
+                        }
+                    ]
+                }],
+            )
+            res = response.choices[0].message.content
 
-            img_data = img_base64
-            st.session_state.use_image_next = False
-            st.session_state.uploaded_image = None
+        elif st.session_state.documents:
+            res = smart_rag_response(prompt, rag_context)
+
 
         else:
+            res = chat_llm(prompt)
 
-            start = time.time()
-            try:
-                res = chat_llm(final_prompt)
-                end = time.time()
-                log_step("LLM_GENERATION", start, end, "SUCCESS")
-            except Exception as e:
-                end = time.time()
-                log_step("LLM_GENERATION", start, end, "FAILED", e)
-                res = "Error generating response"
+        log_step("LLM_GENERATION", start, time.time(), "SUCCESS")
 
-            img_data = None
+        save_message(st.session_state.conversation_id, "user", prompt)
+        save_message(st.session_state.conversation_id, "assistant", res)
 
-        start = time.time()
-        try:
-            save_message(st.session_state.conversation_id, "user", prompt, img_data)
-            save_message(st.session_state.conversation_id, "assistant", res)
-            end = time.time()
-            log_step("POST_PROCESSING", start, end, "SUCCESS")
-        except Exception as e:
-            end = time.time()
-            log_step("POST_PROCESSING", start, end, "FAILED", e)
-
-        st.session_state.chat.append({"role":"user","content":prompt,"image":img_data})
-        st.session_state.chat.append({"role":"assistant","content":res,"image":None})
+        st.session_state.chat.append({"role":"user","content":prompt})
+        st.session_state.chat.append({"role":"assistant","content":res})
 
     for m in st.session_state.chat:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
-            if m.get("image"):
-                st.image(base64.b64decode(m["image"]), width="stretch")
