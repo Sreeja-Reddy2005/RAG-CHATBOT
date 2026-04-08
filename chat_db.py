@@ -2,57 +2,58 @@ import sqlite3
 
 DB_NAME = "chatbot.db"
 
+
 def get_connection():
     return sqlite3.connect(DB_NAME)
 
+
 def create_tables():
     conn = get_connection()
-    cursor = conn.cursor()
+    c = conn.cursor()
 
-   
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
+  
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
         password TEXT
     )
     """)
 
- 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS conversations (
+   
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS conversations(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         title TEXT
     )
     """)
 
-   
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
+ 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS messages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conversation_id INTEGER,
         role TEXT,
-        content TEXT,
-        image TEXT
+        content TEXT
     )
     """)
 
- 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS summaries (
+   
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS documents(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conversation_id INTEGER,
-        summary TEXT
+        file_path TEXT
     )
     """)
 
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS documents (
+   
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS images(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conversation_id INTEGER,
-        content BLOB
+        image_base64 TEXT
     )
     """)
 
@@ -60,103 +61,129 @@ def create_tables():
     conn.close()
 
 
+
 def create_conversation(user_id, title):
     conn = get_connection()
-    cursor = conn.cursor()
+    c = conn.cursor()
 
-    cursor.execute(
+    c.execute(
         "INSERT INTO conversations (user_id, title) VALUES (?, ?)",
         (user_id, title)
     )
 
     conn.commit()
-    cid = cursor.lastrowid
+    cid = c.lastrowid
     conn.close()
-
-    print(" Created conversation:", cid)
     return cid
 
 
-def save_message(conversation_id, role, content, image=None):
-    if conversation_id is None:
-        print(" conversation_id is None")
-        return
-
+def get_conversations(user_id):
     conn = get_connection()
-    cursor = conn.cursor()
+    c = conn.cursor()
 
-    cursor.execute(
-        "INSERT INTO messages (conversation_id, role, content, image) VALUES (?, ?, ?, ?)",
-        (conversation_id, role, content, image)
+    c.execute(
+        "SELECT id, title FROM conversations WHERE user_id=?",
+        (user_id,)
+    )
+
+    data = c.fetchall()
+    conn.close()
+    return data
+
+
+
+def save_message(cid, role, content):
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute(
+        "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
+        (cid, role, content)
     )
 
     conn.commit()
     conn.close()
 
-def save_summary(conversation_id, summary):
-    conn = get_connection()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        "INSERT INTO summaries (conversation_id, summary) VALUES (?, ?)",
-        (conversation_id, summary)
+def get_messages(cid):
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute(
+        "SELECT role, content FROM messages WHERE conversation_id=?",
+        (cid,)
+    )
+
+    rows = c.fetchall()
+    conn.close()
+
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
+
+
+def save_document(cid, file_path):
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute(
+        "INSERT INTO documents (conversation_id, file_path) VALUES (?, ?)",
+        (cid, file_path)
     )
 
     conn.commit()
     conn.close()
 
-def save_document(conversation_id, file_bytes):
-    conn = get_connection()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        "INSERT INTO documents (conversation_id, content) VALUES (?, ?)",
-        (conversation_id, file_bytes)
+def load_document_path(cid):
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute(
+        """
+        SELECT file_path 
+        FROM documents 
+        WHERE conversation_id=? 
+        ORDER BY id DESC 
+        LIMIT 1
+        """,
+        (cid,)
     )
 
-    conn.commit()
-    conn.close()
-
-def load_document(conversation_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT content FROM documents WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
-        (conversation_id,)
-    )
-
-    row = cursor.fetchone()
+    row = c.fetchone()
     conn.close()
 
     return row[0] if row else None
 
 
-def get_messages(conversation_id):
+def save_image(cid, image_base64):
     conn = get_connection()
-    cursor = conn.cursor()
+    c = conn.cursor()
 
-    cursor.execute(
-        "SELECT role, content, image FROM messages WHERE conversation_id=?",
-        (conversation_id,)
+    c.execute(
+        "INSERT INTO images (conversation_id, image_base64) VALUES (?, ?)",
+        (cid, image_base64)
     )
 
-    rows = cursor.fetchall()
+    conn.commit()
     conn.close()
 
-    return [{"role": r[0], "content": r[1], "image": r[2]} for r in rows]
 
-
-def get_conversations(user_id):
+def load_image(cid):
     conn = get_connection()
-    cursor = conn.cursor()
+    c = conn.cursor()
 
-    cursor.execute(
-        "SELECT id, title FROM conversations WHERE user_id=?",
-        (user_id,)
+    c.execute(
+        """
+        SELECT image_base64 
+        FROM images 
+        WHERE conversation_id=? 
+        ORDER BY id DESC 
+        LIMIT 1
+        """,
+        (cid,)
     )
 
-    data = cursor.fetchall()
+    row = c.fetchone()
     conn.close()
 
-    return data
+    return row[0] if row else None
